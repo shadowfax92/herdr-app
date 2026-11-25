@@ -657,8 +657,9 @@ The main ones:
   `terminal.show {terminal?, pane?}`, `terminal.search` (screen and scrollback;
   find bar state stays with that terminal), `terminal.select_all {terminal?}` (selects the whole
   screen and scrollback for copying; only the alternate screen in vim and similar apps;
-  Cmd+A on macOS, no default on Linux/Windows), `terminal.copy`, `terminal.paste` (copied
-  files, such as Finder's or a clipboard manager's image, as if dropped; an image
+  Cmd+A on macOS, no default on Linux/Windows), `terminal.copy`, `terminal.paste {terminal?, text?}`
+  (with `text`, sends it directly using bracketed paste without touching the clipboard; without `text`,
+  pastes copied files, such as Finder's or a clipboard manager's image, as if dropped; an image
   alone as `terminal.paste_image` pastes it), `terminal.paste_image` (Ctrl+V: an
   image, into a terminal on another machine: copied there, its path pasted; on
   Windows, clipboard text is pasted; otherwise Ctrl+V goes to the program, which

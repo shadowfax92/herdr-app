@@ -218,7 +218,7 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
             })
         });
     }
-    for name in ["feedbackPasteImage", "feedbackClearImages", "feedbackAttachImages"] {
+    for name in ["feedbackPasteImage", "feedbackClearImages", "feedbackAttachImages", "selectionText"] {
         module = module.function(name, |_| Ok(HostValue::Null));
     }
     module = module.async_function("feedbackPickImages", |_| Ok(async { Ok(HostValue::Array(vec![])) }));

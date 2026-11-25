@@ -17,6 +17,9 @@ use std::time::{Duration, SystemTime};
 include!(concat!(env!("OUT_DIR"), "/default_mods.rs"));
 include!(concat!(env!("OUT_DIR"), "/frame_mods.rs"));
 
+pub(crate) mod fork; // Fork hook: terminal view index by address and synchronous herdr.selectionText().
+pub use fork::{track_terminal_view, untrack_terminal_view}; // Fork hook.
+
 #[cfg(test)]
 mod render_tests;
 #[cfg(test)]
@@ -1301,6 +1304,7 @@ fn module(inst: Instance, copy: u64) -> HostModule {
             Ok(HostValue::Null)
         })
         .function("terminals", reader(reads.clone(), "terminals", |s| &s.terminals))
+        .function("selectionText", fork::selection_text_host) // Fork hook.
         .function("focused", reader(reads.clone(), "focused", |s| &s.focused))
         .function("layout", reader(reads.clone(), "layout", |s| &s.layout))
         .function("layouts", |_| Ok(to_host(&json!(crate::window::layout_names()))))

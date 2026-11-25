@@ -2,6 +2,7 @@
 //! read back as frames to draw, and asked to encode keys and mouse input.
 
 use ghostty_sys::*;
+mod fork; // Fork hook: cursor_screen_position, set_selection, and row text helpers.
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;

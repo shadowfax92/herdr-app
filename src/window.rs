@@ -1599,6 +1599,7 @@ impl AppWindow {
             let view = cx.new(|cx| TerminalView::attach(self.core.clone(), address.clone(), size_hint, cx));
             self.tell_term(&view, &address, cx);
             mods::track_pane_view(id.clone(), &view);
+            mods::track_terminal_view(address.clone(), &view); // Fork hook: index view by address for selectionText().
             let (block, addr) = (id.clone(), address.clone());
             let sub = cx.subscribe_in(&view, window, move |this, _, ev: &TerminalEvent, window, cx| match ev {
                 TerminalEvent::Peek(address) => this.peek_terminal(address, window, cx),
@@ -1617,12 +1618,14 @@ impl AppWindow {
             });
             let focus = view.read(cx).focus_handle().clone();
             if let Some(previous) = self.terms.insert(id, Term { view, address, focus, _sub: sub }) {
+                mods::untrack_terminal_view(&previous.address, &previous.view); // Fork hook.
                 self.publish_selection(&previous.address, window, cx);
             }
         }
         let gone: Vec<String> = self.terms.keys().filter(|id| !want_terms.contains(*id)).cloned().collect();
         for id in gone {
             if let Some(t) = self.terms.remove(&id) {
+                mods::untrack_terminal_view(&t.address, &t.view); // Fork hook.
                 t.view.read(cx).detach();
                 self.publish_selection(&t.address, window, cx);
             }
@@ -3505,10 +3508,10 @@ impl AppWindow {
                 t.view.update(cx, |view, cx| view.open_search(window, cx));
                 return;
             }
-            "terminal.copy" | "terminal.paste" | "terminal.paste_image" => {
+            "terminal.paste" => { self.dispatch_terminal_paste(a, window, cx); return; } // Fork hook.
+            "terminal.copy" | "terminal.paste_image" => {
                 if let Some(t) = self.focused_terminal(window, cx) {
                     t.view.update(cx, |v, cx| match name {
-                        "terminal.paste" => v.paste(cx),
                         "terminal.paste_image" => v.paste_image(cx),
                         // A command, not a key: copy and leave the selection.
                         _ => { let _ = v.copy(cx); }

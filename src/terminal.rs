@@ -2,6 +2,7 @@
 //! with GPUI, keys and mouse encoded by libghostty-vt and sent back.
 
 mod drag_paths;
+mod fork; // Fork hook: direct bracketed paste, selection_text, and test helpers.
 
 use crate::hc::{Core, Stream};
 use crate::vt::{self, CursorShape, Rgb, Select, Vt};
@@ -195,6 +196,8 @@ pub struct TerminalView {
     published_from_bottom: Option<u64>,
     _render_hold: Option<(Instant, Task<()>)>,
     _reader: Option<Task<()>>,
+    #[cfg(test)]
+    last_sent: RefCell<Vec<u8>>, // Fork hook: capture sent PTY bytes in unit tests.
 }
 
 thread_local! {
@@ -359,6 +362,8 @@ impl TerminalView {
             published_from_bottom: None,
             _render_hold: None,
             _reader: None,
+            #[cfg(test)]
+            last_sent: RefCell::new(Vec::new()), // Fork hook.
         };
         view.connect(core, cx);
         view
@@ -684,6 +689,8 @@ impl TerminalView {
 
     fn send(&self, bytes: &[u8]) {
         self.typed_at.set(Some(Instant::now()));
+        #[cfg(test)]
+        self.last_sent.borrow_mut().extend_from_slice(bytes); // Fork hook.
         let mut g = self.grid.borrow_mut();
         if let Some(ch) = g.channel
             && !bytes.is_empty()

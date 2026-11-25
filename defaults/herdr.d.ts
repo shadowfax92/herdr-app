@@ -76,7 +76,8 @@ export function playSound(sound: string): null;
  *   terminal.keep {terminal, place?} (a running one without a pane, e.g. a sub-agent, gets one),
  *   terminal.park {terminal} (its pane goes, it keeps running; the menu's "Send back"),
  *   terminal.peek {terminal} (peek over the tab, with keep-as-tab and close),
- *   terminal.show {terminal?, pane?} (shown in the pane for now, in place of its own), terminal.copy, terminal.paste,
+ *   terminal.show {terminal?, pane?} (shown in the pane for now, in place of its own), terminal.copy,
+ *   terminal.paste {terminal?, text?} (with text, sends directly via bracketed paste without touching the clipboard),
  *   terminal.select {terminal?, at?: {row, col} | "cursor", mode?: "cell" | "word" | "line"} (replaces the selection; defaults to cursor and cell).
  *   terminal.adjust_selection {terminal?, direction: "left" | "right" | "up" | "down" | "page_up" | "page_down" | "home" | "end" | "line_start" | "line_end"} (moves the inclusive moving end; view follows; fails without selection).
  *   terminal.clear_selection {terminal?}. No default keys or built-in copy mode.
@@ -491,6 +492,9 @@ export type HandleLink = (click: LinkClick) => "handled" | "pass" | Promise<"han
 /** Size is not a prop: root div/h_flex/v_flex.on_size_change reports logical px.
  * The exported View may implement async close(cx) for bounded final cleanup. */
 export function props(): any;
+
+/** Formatted Ghostty selection text for `terminal` (default: focused terminal), or null. */
+export function selectionText(terminal?: string): string | null;
 
 /** Reads a value every mod can see (persisted). */
 export function shared(key: string): unknown;
