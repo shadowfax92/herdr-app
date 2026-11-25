@@ -20,6 +20,51 @@ impl AppWindow {
             .unwrap_or_else(|| overlay.focus.clone())
     }
 
+    /// Open the inline comment note card when copy mode presses `c`.
+    pub(super) fn open_copy_comment(&mut self, addr: &str, quote: String, window: &mut Window, cx: &mut Context<Self>) {
+        let (id, spec) = crate::terminal::copy_mode::comment_overlay_spec(
+            addr,
+            quote,
+            window.viewport_size().width,
+            crate::terminal::cell_size(window).width,
+        );
+        self.open_overlay(id, spec, window, cx);
+    }
+
+    /// Dispatch `terminal.copy_mode { terminal?, action?, key? }`.
+    pub(super) fn dispatch_terminal_copy_mode(&mut self, a: &Value, window: &mut Window, cx: &mut Context<Self>) {
+        let view = match a.get("terminal") {
+            None | Some(Value::Null) => self
+                .focused_terminal(window, cx)
+                .map(|t| t.view.clone())
+                .ok_or_else(|| "no focused terminal for copy mode".into()),
+            Some(Value::String(address)) => self.shown_terminal_view(address, window, cx),
+            Some(_) => return self.fail("terminal.copy_mode: terminal must be a string"),
+        };
+        let action = match a.get("action") {
+            None | Some(Value::Null) => "toggle",
+            Some(Value::String(s)) => s.as_str(),
+            Some(_) => return self.fail("terminal.copy_mode: action must be a string"),
+        };
+        let key = match a.get("key") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => return self.fail("terminal.copy_mode: key must be a string"),
+        };
+        match view.and_then(|v| {
+            let addr = v.read(cx).address.clone();
+            v.update(cx, |v, cx| v.copy_mode_command(action, key, window, cx)).map(|r| (addr, r))
+        }) {
+            Ok((addr, (status, comment))) => {
+                if let Some(quote) = comment {
+                    self.open_copy_comment(&addr, quote, window, cx);
+                }
+                self.answer(Ok(status));
+            }
+            Err(error) => self.fail(error),
+        }
+    }
+
     /// Dispatch `terminal.paste { terminal?, text? }`.
     /// When `text` is supplied, validates against unsafe control characters
     /// (matching `herdr-tools/crates/comment/src/format.rs:84-92`: only `\n` and `\t`

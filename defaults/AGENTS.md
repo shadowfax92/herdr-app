@@ -655,7 +655,8 @@ The main ones:
   `terminal.keep {terminal, place?}`, `terminal.park {terminal}`,
   `terminal.peek {terminal}` (peek over the tab, with keep-as-tab and close),
   `terminal.show {terminal?, pane?}`, `terminal.search` (screen and scrollback;
-  find bar state stays with that terminal), `terminal.select_all {terminal?}` (selects the whole
+  find bar state stays with that terminal), `terminal.copy_mode {terminal?, action?, key?}`
+  (native vi copy mode: toggle, enter, exit, key, or status; defaults to focused terminal), `terminal.select_all {terminal?}` (selects the whole
   screen and scrollback for copying; only the alternate screen in vim and similar apps;
   Cmd+A on macOS, no default on Linux/Windows), `terminal.copy`, `terminal.paste {terminal?, text?}`
   (with `text`, sends it directly using bracketed paste without touching the clipboard; without `text`,

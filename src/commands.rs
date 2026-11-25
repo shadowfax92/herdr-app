@@ -74,6 +74,8 @@ pub const COMMANDS: &[Command] = &[
     cmd("terminal.paste", &[opt("terminal"), opt("text")], "Paste into a terminal (default: the focused one). With text, sends it directly using bracketed paste without touching the clipboard; without text, pastes the clipboard (copied files as if dropped; an image alone as terminal.paste_image pastes it)."),
     cmd("terminal.paste_image", &[], "Ctrl+V: the clipboard's image as a file on the focused terminal's machine, when that's another one; on Windows, paste clipboard text; otherwise Ctrl+V goes to the terminal."),
     cmd("terminal.search", &[], "Search the focused terminal's screen and scrollback; the find bar and query stay with that terminal."),
+    // Fork hook: native vi copy mode command.
+    cmd("terminal.copy_mode", &[opt("terminal"), opt("action"), opt("key")], "Toggle or drive native vi copy mode in a terminal (default: the focused one). action: toggle (default), enter, exit, key (with key), status."),
     cmd("agent.focus", &[req("terminal")], "Show an agent (sub-agents too)."),
     cmd("agent.next", &[], "Show the next agent, in the order the agents list shows them."),
     cmd("agent.prev", &[], "Show the previous agent."),

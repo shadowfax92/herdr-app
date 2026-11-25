@@ -1615,6 +1615,7 @@ impl AppWindow {
                     this.open_menu("pane", json!({ "pane": block.trim_end_matches(SWAP), "terminal": addr }), Some(*at), window, cx)
                 }
                 TerminalEvent::Notice { title, body } => this.error_notice(title, body, window, cx),
+                TerminalEvent::CopyComment { quote } => this.open_copy_comment(&addr, quote.clone(), window, cx), // Fork hook.
             });
             let focus = view.read(cx).focus_handle().clone();
             if let Some(previous) = self.terms.insert(id, Term { view, address, focus, _sub: sub }) {
@@ -3508,6 +3509,7 @@ impl AppWindow {
                 t.view.update(cx, |view, cx| view.open_search(window, cx));
                 return;
             }
+            "terminal.copy_mode" => { self.dispatch_terminal_copy_mode(a, window, cx); return; } // Fork hook.
             "terminal.paste" => { self.dispatch_terminal_paste(a, window, cx); return; } // Fork hook.
             "terminal.copy" | "terminal.paste_image" => {
                 if let Some(t) = self.focused_terminal(window, cx) {

@@ -4,7 +4,6 @@
 
 use super::*;
 
-#[allow(dead_code)] // Used by Commit 3's copy_mode and unit tests.
 impl Vt {
     /// Expose the live terminal cursor in screen-space coordinates for copy mode entry.
     pub fn cursor_screen_position(&self) -> CellPosition {

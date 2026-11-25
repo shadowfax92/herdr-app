@@ -2,6 +2,7 @@
 //! with GPUI, keys and mouse encoded by libghostty-vt and sent back.
 
 mod drag_paths;
+pub(crate) mod copy_mode; // Fork hook: native vi copy mode + inline comment overlay sizing.
 mod fork; // Fork hook: direct bracketed paste, selection_text, and test helpers.
 
 use crate::hc::{Core, Stream};
@@ -81,6 +82,7 @@ pub enum TerminalEvent {
     ContextMenu(Point<Pixels>),
     /// Something the person asked for failed: an error toast.
     Notice { title: String, body: String },
+    CopyComment { quote: String }, // Fork hook: copy mode `c` requested an inline comment note card.
 }
 
 /// Rows of scrollback history as Ghostty's scrollbar reports them. `from_bottom`
@@ -191,6 +193,7 @@ pub struct TerminalView {
     search_input: Option<Entity<InputState>>,
     pending_search_nav: Option<bool>,
     search_task: Option<Task<()>>,
+    copy_mode: Option<copy_mode::CopyMode>, // Fork hook: native vi copy mode state.
     attach_deadline: Instant,
     /// Last observed distance; output only publishes transitions to/from the end.
     published_from_bottom: Option<u64>,
@@ -358,6 +361,7 @@ impl TerminalView {
             search_input: None,
             pending_search_nav: None,
             search_task: None,
+            copy_mode: None, // Fork hook.
             attach_deadline,
             published_from_bottom: None,
             _render_hold: None,
@@ -894,6 +898,7 @@ impl TerminalView {
             _ => unreachable!(),
         }
         drop(grid);
+        self.sync_copy_mode_external_selection(); // Fork hook.
         self.selection_changed(cx);
         self.publish_scroll_if_changed(cx);
         self.copy_primary(cx);
@@ -903,6 +908,7 @@ impl TerminalView {
 
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
         self.grid.borrow_mut().vt.select_all();
+        self.sync_copy_mode_external_selection(); // Fork hook.
         self.selection_changed(cx);
         self.copy_primary(cx);
         cx.notify();
@@ -910,6 +916,7 @@ impl TerminalView {
 
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.grid.borrow_mut().vt.clear_selection();
+        self.sync_copy_mode_external_selection(); // Fork hook.
         self.selection_changed(cx);
         cx.notify();
     }
@@ -1034,6 +1041,7 @@ impl TerminalView {
             // leak its keystrokes into the shell running in this terminal.
             return;
         }
+        if self.handle_copy_mode_key(ev, cx) { return; } // Fork hook: route keys to native vi copy mode.
         let k = &ev.keystroke;
         // Typing clears a selection, as in Herdr.
         if !k.key.starts_with("shift") && !k.key.starts_with("control") && !k.key.starts_with("alt") {
@@ -1048,6 +1056,7 @@ impl TerminalView {
 
     fn scroll(&mut self, ev: &ScrollWheelEvent, _w: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        if self.handle_copy_mode_scroll(ev, cx) { return; } // Fork hook: never leak scroll to PTY in copy mode.
         let mut g = self.grid.borrow_mut();
         let steps = scroll_delta_steps(&mut self.scrolled, ev.delta, ev.touch_phase, g.cell, g.vt.cols, g.vt.rows, crate::settings::get().terminal_scroll_speed);
         let n = steps.y.unsigned_abs() as usize;
@@ -1123,6 +1132,7 @@ impl TerminalView {
     /// Sends a mouse event to a program that tracks the mouse. Returns whether it did
     /// (shift keeps the mouse for Herdr: selecting, the menu).
     fn mouse(&mut self, action: GhosttyMouseAction, button: Option<MouseButton>, pos: Point<Pixels>, mods: Modifiers) -> bool {
+        if self.copy_mode.is_some() { return false; } // Fork hook: never send mouse input to PTY in copy mode.
         let mut g = self.grid.borrow_mut();
         if !track_mouse_button(&mut g.buttons_down, action, button) {
             return false;
@@ -2128,7 +2138,7 @@ fn find_input_style() -> InputEditorStyle {
     }
 }
 
-fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, window: &mut Window, cx: &mut App) {
+fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, copy_cursor: Option<vt::CellPosition>, window: &mut Window, cx: &mut App) {
     crate::bench::count(&crate::bench::GRID);
     let mut g = grid.borrow_mut();
     let cell = g.cell;
@@ -2170,6 +2180,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     g.images.retain(|k, _| keep.contains(k));
     let link_spans = g.link_spans.clone();
     let marked = g.marked.clone();
+    let copy_cursor_vp = copy_mode::project_cursor(&g.vt, copy_cursor); // Fork hook.
     drop(g);
 
     window.paint_quad(fill(bounds, hsla(frame.bg).opacity(crate::settings::get().terminal_opacity)));
@@ -2319,7 +2330,11 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
 
     paint_images(false, window);
 
-    if let Some(cur) = frame.cursor {
+    if let Some((x, y)) = copy_cursor_vp {
+        copy_mode::paint_cursor(&frame, x, y, origin, cell, metrics, window, cx); // Fork hook.
+    } else if copy_cursor.is_none()
+        && let Some(cur) = frame.cursor
+    {
         let (x, y) = (cur.x as usize, cur.y as usize);
         let wide = frame.rows.get(y).and_then(|r| r.get(x)).is_some_and(|c| c.wide);
         let w = cell.width * if wide { 2.0 } else { 1.0 };
@@ -2427,7 +2442,7 @@ impl EntityInputHandler for TerminalView {
         // While the find field holds the keys, the input-method path must not
         // be a way around that (see `key_down`); with the terminal focused,
         // input methods type into the program as usual.
-        if !self.find_field_focused(window, cx) {
+        if !self.find_field_focused(window, cx) && self.copy_mode.is_none() { // Fork hook.
             self.send(text.as_bytes());
         }
         cx.notify();
@@ -2443,7 +2458,7 @@ impl EntityInputHandler for TerminalView {
     ) {
         // Composition previews stay out of the terminal too while the find
         // field holds the keys; with the terminal focused they show as usual.
-        if self.find_field_focused(window, cx) {
+        if self.find_field_focused(window, cx) || self.copy_mode.is_some() { // Fork hook.
             return;
         }
         self.grid.borrow_mut().marked = (!text.is_empty()).then(|| text.to_owned());
@@ -2507,11 +2522,12 @@ impl Render for TerminalView {
             format!("{} matches", search_progress.total)
         };
         let address = self.address.clone();
+        let (copy_cursor, copy_bar, in_copy_mode) = self.prepare_copy_mode_render(&address, cx); // Fork hook.
 
         div()
             .id(SharedString::from(format!("term-{}", self.address)))
             .track_focus(&self.focus)
-            .key_context("Terminal")
+            .key_context(if in_copy_mode { "TerminalCopyMode" } else { "Terminal" }) // Fork hook.
             .size_full()
             .relative()
             // Below 1, the layout's background shows through (cells a program colors stay solid).
@@ -2531,7 +2547,7 @@ impl Render for TerminalView {
                 }
                 // `send:<text>` bindings from keys.json type into this terminal.
                 match a.id().strip_prefix("send:") {
-                    Some(_) if this.find_field_focused(window, cx) => cx.stop_propagation(),
+                    Some(_) if this.find_field_focused(window, cx) || this.copy_mode.is_some() => cx.stop_propagation(), // Fork hook.
                     Some(text) => this.send(text.as_bytes()),
                     None => cx.propagate(),
                 }
@@ -2589,6 +2605,7 @@ impl Render for TerminalView {
                     return;
                 }
                 drop(g);
+                if this.copy_mode.is_some() { return; } // Fork hook: keep copy-mode selection and PTY intact on click.
                 if this.mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(ev.button), ev.position, ev.modifiers) {
                     // The program took the click: Herdr's old selection ends, so a copy can't repeat it.
                     this.clear_selection(cx);
@@ -2608,6 +2625,7 @@ impl Render for TerminalView {
                 }
             }))
             .on_mouse_down(MouseButton::Middle, cx.listener(|this, ev: &MouseDownEvent, _, _cx| {
+                if this.copy_mode.is_some() { return; } // Fork hook: block middle-click paste/PTY leak in copy mode.
                 if !this.mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(ev.button), ev.position, ev.modifiers) {
                     // macOS has no PRIMARY selection, so an unclaimed middle-click does nothing.
                     #[cfg(target_os = "linux")]
@@ -2635,7 +2653,7 @@ impl Render for TerminalView {
                         grid.borrow_mut().fit(cols, rows, cell, window.scale_factor());
                     },
                     move |bounds, _, window, cx| {
-                        paint_grid(bounds, &grid_paint, focused, window, cx);
+                        paint_grid(bounds, &grid_paint, focused, copy_cursor, window, cx); // Fork hook.
                         let view = selection_view.clone();
                         window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
                             if phase == DispatchPhase::Capture {
@@ -2693,13 +2711,14 @@ impl Render for TerminalView {
                         });
                         // While focused, the OS input methods (Pinyin, Japanese,
                         // dead keys) type into this terminal.
-                        if terminal_focused {
+                        if terminal_focused && !in_copy_mode { // Fork hook: suspend IME handler while in copy mode.
                             window.handle_input(&input_focus, ElementInputHandler::new(bounds, input_view), cx);
                         }
                     },
                 )
                 .size_full(),
             )
+            .when_some(copy_bar, |d, bar| d.child(bar)) // Fork hook: bottom 1-row COPY mode bar.
             .when_some(search_input, |d, input| {
                 d.child(
                     div()
