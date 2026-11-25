@@ -1,0 +1,54 @@
+#!/bin/bash
+# Build and ad-hoc sign ~/Applications/Herdr Fork.app for local testing without
+# touching /Applications/Herdr.app or ~/.local/bin/herdr-app.
+set -euo pipefail
+
+[[ $(uname -s) == Darwin ]] || { echo 'This script requires macOS.' >&2; exit 1; }
+cd "$(dirname "$0")/.."
+
+# Never enable upstream release self-updates or telemetry on the fork.
+unset HERDR_APP_RELEASE
+
+ZIG="${ZIG:-/Users/shadowfax/.local/share/herdr-build/zig-aarch64-macos-0.16.0/zig}"
+[[ -x "$ZIG" ]] || { echo "Zig 0.16.0 not found at $ZIG" >&2; exit 1; }
+
+ZIG="$ZIG" cargo build --release --locked
+
+app="$HOME/Applications/Herdr Fork.app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$HOME/.local/bin"
+
+# Replace atomically so rebuilding does not corrupt an existing binary.
+cp target/release/herdr-app "$app/Contents/MacOS/Herdr.new"
+mv -f "$app/Contents/MacOS/Herdr.new" "$app/Contents/MacOS/Herdr"
+chmod +x "$app/Contents/MacOS/Herdr"
+cp assets/icons/Herdr.icns "$app/Contents/Resources/Herdr.icns"
+
+cat > "$app/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleExecutable</key><string>Herdr</string>
+    <key>CFBundleIdentifier</key><string>dev.herdr.app.fork</string>
+    <key>CFBundleName</key><string>Herdr Fork</string>
+    <key>CFBundleDisplayName</key><string>Herdr Fork</string>
+    <key>CFBundleIconFile</key><string>Herdr</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.1.18-fork</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>NSMicrophoneUsageDescription</key><string>Terminal programs running in Herdr can use the microphone, for example for voice input.</string>
+    <key>NSCameraUsageDescription</key><string>Terminal programs running in Herdr can use the camera.</string>
+    <key>NSAppleEventsUsageDescription</key><string>Terminal programs running in Herdr can use AppleScript to control other apps.</string>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>LSEnvironment</key><dict/></dict></plist>
+PLIST
+
+# Finder does not inherit a login shell's PATH; hc and nvim must stay discoverable.
+/usr/libexec/PlistBuddy -c "Add :LSEnvironment:PATH string $HOME/.local/bin:/opt/homebrew/bin:$PATH" "$app/Contents/Info.plist"
+codesign --force --sign - --entitlements scripts/macos-entitlements.plist "$app"
+codesign --verify --deep --strict "$app"
+
+# Keep ~/.local/bin/herdr-app pointing at the official app.
+ln -sfn "$app/Contents/MacOS/Herdr" "$HOME/.local/bin/herdr-app-fork"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app"
+echo "Installed $app and linked $HOME/.local/bin/herdr-app-fork."

@@ -119,8 +119,9 @@ pub fn set_core(version: Option<String>, managed: Option<String>) {
     }
 }
 
+// Fork hook: disable self-updates so this local fork never overwrites itself with upstream releases.
 fn checks_app() -> Option<PathBuf> {
-    root().filter(|_| option_env!("HERDR_APP_RELEASE").is_some() || std::env::var_os("HERDR_RELEASES_URL").is_some())
+    None
 }
 
 /// A release build checks the core; a source build only when pointed at a test release server.
@@ -901,3 +902,6 @@ mod tests {
         assert_eq!(sha256(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
 }
+
+#[cfg(test)]
+mod fork_tests; // Fork hook: fork-only update tests.

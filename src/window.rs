@@ -6,6 +6,7 @@
 
 use crate::hc::Core;
 mod floats;
+mod fork; // Fork hook: overlay focus, direct paste, and copy-mode window dispatch.
 mod movable;
 mod pane_drag;
 mod pane_size;
@@ -1753,12 +1754,13 @@ impl AppWindow {
     /// reload), it goes to the top dialog, else the shown agent or focused pane,
     /// else the window, where the app's keys work.
     fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let dialog = self.overlays.iter().rev().find(|o| o.kind.modal_keys()).map(|o| o.focus.clone());
+        let top_dialog = self.overlays.iter().rev().find(|o| o.kind.modal_keys());
         // A dialog whose mod already focused something inside it (its input) keeps that:
         // handing the keyboard to the frame would leave typing with nowhere to go.
-        if dialog.as_ref().is_some_and(|d| d.contains_focused(window, cx)) {
+        if top_dialog.is_some_and(|o| o.focus.contains_focused(window, cx)) {
             return;
         }
+        let dialog = top_dialog.map(|o| self.overlay_focus(o)); // Fork hook: focus terminal-hosting dialog directly.
         // An explicit handoff ends the mod block's turn with the keyboard.
         if dialog.is_none() && window.focus_was_yielded() {
             self.focused_block = None;
@@ -7741,6 +7743,7 @@ export default class Probe extends View {
     }
 
     include!("window/drag_tests.rs");
+    include!("window/fork_tests.rs"); // Fork hook.
 
     /// The whole path, in a real window: a layout names the toast mod, a
     /// notification opens it with its props, and it can close itself (as one
