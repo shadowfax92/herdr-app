@@ -1,0 +1,327 @@
+# Rebase `fork` onto the latest upstream release tag (or a chosen ref), run
+# tests on Linux (matching upstream ci.yml), and either publish a new fork-v*
+# tag + trigger fork-release (macos-15) or open/update one GitHub issue with
+# the failure details (option A).
+name: fork-sync
+run-name: fork sync${{ inputs.target && format(' -> {0}', inputs.target) || '' }}${{ inputs.dry_run && ' (dry run)' || '' }}
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Upstream tag or commit SHA (default: latest upstream v* tag)"
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Rebase and test without pushing, tagging, or releasing"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+  ZIG_VERSION: 0.16.0
+  CARGO_PROFILE_DEV_DEBUG: "1"
+  CARGO_PROFILE_TEST_DEBUG: "1"
+  CARGO_INCREMENTAL: "0"
+  UPSTREAM_URL: https://github.com/herdrdev/herdr-app.git
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fork
+          fetch-depth: 0
+          submodules: true
+
+      - name: Restore rerere cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .git/rr-cache
+          key: fork-rr-cache-${{ github.run_id }}
+          restore-keys: fork-rr-cache-
+
+      - name: Fetch upstream and attempt rebase
+        id: rebase
+        env:
+          INPUT_TARGET: ${{ inputs.target }}
+        run: |
+          git config rerere.enabled true
+          git config rerere.autoupdate true
+          git config rebase.autoSquash true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --tags origin
+          git fetch --tags --force upstream master
+
+          old_head=$(git rev-parse HEAD)
+          if [[ -n "$INPUT_TARGET" ]]; then
+            target_label="$INPUT_TARGET"
+            if ! git rev-parse --verify "${INPUT_TARGET}^{commit}" >/dev/null 2>&1; then
+              git fetch upstream "$INPUT_TARGET"
+            fi
+            target_sha=$(git rev-parse "${INPUT_TARGET}^{commit}" 2>/dev/null || git rev-parse FETCH_HEAD)
+          else
+            target_label=$(git ls-remote --tags --refs upstream 'refs/tags/v*' \
+              | awk -F/ '{print $NF}' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -1)
+            [[ -n "$target_label" ]] || { echo "No upstream v* tags found" >&2; exit 1; }
+            target_sha=$(git rev-parse "refs/tags/${target_label}^{commit}")
+          fi
+
+          echo "old_head=$old_head" >> "$GITHUB_OUTPUT"
+          echo "target_label=$target_label" >> "$GITHUB_OUTPUT"
+          echo "target_sha=$target_sha" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$target_sha" HEAD; then
+            echo "Base $target_label ($target_sha) is already in fork ($old_head); nothing to do."
+            echo "status=up_to_date" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          merge_base=$(git merge-base HEAD "$target_sha")
+          tag_base=$(git tag --merged HEAD --sort=-v:refname 'v*' | head -1 || true)
+          old_base="$merge_base"
+          if [[ -n "$tag_base" ]]; then
+            tag_sha=$(git rev-parse "${tag_base}^{commit}")
+            if git merge-base --is-ancestor "$merge_base" "$tag_sha" && [[ "$tag_sha" != "$merge_base" ]]; then
+              old_base="$tag_sha"
+            fi
+          fi
+          echo "old_base=$old_base" >> "$GITHUB_OUTPUT"
+          echo "Rebasing $old_base..$old_head onto $target_label ($target_sha)"
+
+          git checkout -B sync-try
+          if git rebase --autosquash --onto "$target_sha" "$old_base"; then
+            git submodule sync --recursive
+            git submodule update --init --recursive
+            git range-diff "$old_base..$old_head" "$target_sha..HEAD" > /tmp/fork-range-diff.txt || true
+            echo "status=rebased" >> "$GITHUB_OUTPUT"
+            echo "=== range-diff ==="
+            cat /tmp/fork-range-diff.txt
+          else
+            git diff --name-only --diff-filter=U | sort -u > /tmp/fork-conflicts.txt || true
+            git status --short > /tmp/fork-conflict-status.txt || true
+            git rebase --abort || true
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            echo "=== conflicting files ==="
+            cat /tmp/fork-conflicts.txt
+          fi
+
+          if [[ -d .git/rr-cache ]] && [[ -n "$(ls -A .git/rr-cache 2>/dev/null)" ]]; then
+            echo "has_rr=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save rerere cache
+        if: always() && steps.rebase.outputs.has_rr == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .git/rr-cache
+          key: fork-rr-cache-${{ github.run_id }}
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        if: steps.rebase.outputs.status == 'rebased'
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: steps.rebase.outputs.status == 'rebased'
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Restore test build cache
+        id: cache
+        if: steps.rebase.outputs.status == 'rebased'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: &cache-paths |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: fork-sync-linux-x86_64-${{ env.RUST_TOOLCHAIN }}-zig${{ env.ZIG_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**', 'crates/**') }}
+          restore-keys: fork-sync-linux-x86_64-${{ env.RUST_TOOLCHAIN }}-zig${{ env.ZIG_VERSION }}-
+
+      - name: Linux build dependencies
+        if: steps.rebase.outputs.status == 'rebased'
+        timeout-minutes: 10
+        run: |
+          scripts/ci-apt \
+            pkg-config clang libclang-dev \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libvulkan-dev mesa-vulkan-drivers libfontconfig-dev libfreetype-dev
+
+      - name: Keep unchanged sources fresh
+        if: steps.rebase.outputs.status == 'rebased'
+        run: scripts/ci-sources restore
+
+      - name: Build tests
+        id: build_tests
+        if: steps.rebase.outputs.status == 'rebased'
+        run: |
+          unset HERDR_APP_RELEASE
+          set +e
+          cargo test --locked --config 'profile.dev.package."*".opt-level=0' --no-run 2>&1 | tee /tmp/fork-test.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [[ $rc -eq 0 ]]; then
+            echo "status=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Note the sources the cache was built from
+        if: steps.build_tests.outputs.status == 'ok' && steps.cache.outputs.cache-hit != 'true'
+        run: scripts/ci-sources record
+
+      - name: Persist test build cache
+        if: steps.build_tests.outputs.status == 'ok' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *cache-paths
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Run tests
+        id: tests
+        if: steps.build_tests.outputs.status == 'ok'
+        run: |
+          unset HERDR_APP_RELEASE
+          set +e
+          cargo test --locked --config 'profile.dev.package."*".opt-level=0' -- --test-threads 4 2>&1 | tee /tmp/fork-test.log
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          if [[ $rc -eq 0 ]]; then
+            echo "status=passed" >> "$GITHUB_OUTPUT"
+          else
+            grep -E '^test .+ \.\.\. FAILED$' /tmp/fork-test.log | awk '{print $2}' | sort -u > /tmp/fork-failed-tests.txt || true
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push rebased fork, tag, and start release
+        if: steps.rebase.outputs.status == 'rebased' && steps.tests.outputs.status == 'passed' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          old_head="${{ steps.rebase.outputs.old_head }}"
+          target_label="${{ steps.rebase.outputs.target_label }}"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
+          last_n=$(git tag -l "fork-v${version}-*" \
+            | sed -n "s/^fork-v${version}-\([0-9][0-9]*\)$/\1/p" \
+            | sort -n \
+            | tail -1)
+          next_n=$(( ${last_n:-0} + 1 ))
+          next_tag="fork-v${version}-${next_n}"
+          backup_ref="refs/heads/backup/pre-${next_tag}"
+
+          git push origin "${old_head}:${backup_ref}"
+          git push --force-with-lease="refs/heads/fork:${old_head}" origin "HEAD:refs/heads/fork"
+          git tag -a "$next_tag" -m "Fork release $next_tag (rebased onto $target_label)"
+          git push origin "refs/tags/$next_tag"
+
+          # A tag pushed with GITHUB_TOKEN does not trigger push workflows; dispatch explicitly.
+          gh workflow run fork-release.yml --repo "$GITHUB_REPOSITORY" --ref "$next_tag"
+          echo "Published $next_tag (backup at backup/pre-$next_tag) and dispatched fork-release.yml."
+
+          # Close any open fork-sync failure issue now that sync is clean.
+          issue_num=$(gh issue list --repo "$GITHUB_REPOSITORY" --label fork-sync --state open --json number --jq '.[0].number // empty')
+          if [[ -n "$issue_num" ]]; then
+            gh issue close "$issue_num" --repo "$GITHUB_REPOSITORY" --comment "Resolved by clean sync to \`$target_label\` -> \`$next_tag\` (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
+          fi
+
+      - name: Dry-run summary
+        if: steps.rebase.outputs.status == 'rebased' && steps.tests.outputs.status == 'passed' && inputs.dry_run == true
+        run: |
+          echo "dry_run=true: clean rebase onto ${{ steps.rebase.outputs.target_label }} (${{ steps.rebase.outputs.target_sha }}) and tests passed; skipped push, tag, and release."
+
+      - name: Open or update conflict/failure issue (option A)
+        if: steps.rebase.outputs.status == 'conflict' || steps.build_tests.outputs.status == 'failed' || steps.tests.outputs.status == 'failed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          target_label="${{ steps.rebase.outputs.target_label }}"
+          target_sha="${{ steps.rebase.outputs.target_sha }}"
+          old_head="${{ steps.rebase.outputs.old_head }}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          dry_note=""
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            dry_note=" (dry run)"
+          fi
+
+          if [[ "${{ steps.rebase.outputs.status }}" == "conflict" ]]; then
+            kind="rebase conflict"
+          else
+            kind="test failure"
+          fi
+
+          body_file=$(mktemp)
+          trap 'rm -f "$body_file"' EXIT
+          {
+            echo "Automated \`fork-sync\` hit a **${kind}**${dry_note} while rebasing \`fork\` onto \`${target_label}\` (\`${target_sha}\`)."
+            echo ""
+            echo "- Current \`fork\`: \`${old_head}\`"
+            echo "- Target: \`${target_label}\` (\`${target_sha}\`)"
+            echo "- Actions run: ${run_url}"
+            echo ""
+            if [[ -s /tmp/fork-conflicts.txt ]]; then
+              echo "### Conflicting files"
+              echo '```text'
+              cat /tmp/fork-conflicts.txt
+              echo '```'
+              echo ""
+            fi
+            if [[ -s /tmp/fork-failed-tests.txt ]]; then
+              echo "### Failing tests"
+              echo '```text'
+              cat /tmp/fork-failed-tests.txt
+              echo '```'
+              echo ""
+            elif [[ "${{ steps.build_tests.outputs.status }}" == "failed" || "${{ steps.tests.outputs.status }}" == "failed" ]]; then
+              echo "### Test / build error tail"
+              echo '```text'
+              tail -n 40 /tmp/fork-test.log
+              echo '```'
+              echo ""
+            fi
+            echo "### Fix locally"
+            echo '```bash'
+            echo "fork/scripts/fork-rebase ${target_label}"
+            echo '```'
+          } > "$body_file"
+
+          gh label create fork-sync --repo "$GITHUB_REPOSITORY" --color B60205 --description "Automated fork-sync conflict or test failure" --force
+          title="fork-sync: ${kind} on ${target_label}"
+          issue_num=$(gh issue list --repo "$GITHUB_REPOSITORY" --label fork-sync --state open --json number --jq '.[0].number // empty')
+          if [[ -n "$issue_num" ]]; then
+            gh issue edit "$issue_num" --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body_file"
+            gh issue comment "$issue_num" --repo "$GITHUB_REPOSITORY" --body "Updated from ${run_url} (${kind}${dry_note})."
+            echo "Updated issue #${issue_num}."
+          else
+            issue_url=$(gh issue create --repo "$GITHUB_REPOSITORY" --label fork-sync --title "$title" --body-file "$body_file")
+            echo "Opened ${issue_url}."
+          fi
+          exit 1

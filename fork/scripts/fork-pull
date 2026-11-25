@@ -1,0 +1,184 @@
+#!/bin/bash
+# Download, verify, mod-check, and install a released Herdr Fork.app.
+#
+# Usage:
+#   fork/scripts/fork-pull [--tag <tag>] [--from <tar.gz>] [--dest <dir>] [--repo <owner/repo>]
+#
+# Never quits a running Herdr Fork.app; keeps the prior bundle outside
+# ~/Applications in ~/.local/share/herdr-fork-backup/ for instant rollback.
+set -euo pipefail
+
+[[ $(uname -s) == Darwin ]] || { echo 'fork-pull: macOS only.' >&2; exit 1; }
+
+repo="${FORK_REPO:-shadowfax92/herdr-app}"
+tag=""
+from_archive=""
+dest_override=""
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+repo_root="$(cd "$script_dir/../.." && pwd)"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tag) tag="${2:?missing --tag value}"; shift 2 ;;
+    --from) from_archive="${2:?missing --from value}"; shift 2 ;;
+    --dest) dest_override="${2:?missing --dest value}"; shift 2 ;;
+    --repo) repo="${2:?missing --repo value}"; shift 2 ;;
+    -h|--help)
+      sed -n '2,8p' "$0"
+      exit 0
+      ;;
+    *) echo "fork-pull: unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+
+version_lt() {
+  local a="$1" b="$2"
+  local IFS=.
+  local -a va vb
+  read -r -a va <<< "${a#v}"
+  read -r -a vb <<< "${b#v}"
+  local i max=${#va[@]}
+  (( ${#vb[@]} > max )) && max=${#vb[@]}
+  for (( i = 0; i < max; i++ )); do
+    local na=$(( 10#${va[i]:-0} ))
+    local nb=$(( 10#${vb[i]:-0} ))
+    if (( na < nb )); then return 0; fi
+    if (( na > nb )); then return 1; fi
+  done
+  return 1
+}
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+if [[ -n "$from_archive" ]]; then
+  [[ -f "$from_archive" ]] || { echo "fork-pull: archive not found: $from_archive" >&2; exit 1; }
+  from_abs="$(cd "$(dirname "$from_archive")" && pwd)/$(basename "$from_archive")"
+  tag="${tag:-local:$(basename "$from_abs")}"
+  archive="$work/$(basename "$from_abs")"
+  cp "$from_abs" "$archive"
+  if [[ -f "$(dirname "$from_abs")/SHA256SUMS" ]]; then
+    cp "$(dirname "$from_abs")/SHA256SUMS" "$work/SHA256SUMS"
+  fi
+else
+  if [[ -z "$tag" ]]; then
+    tag=$(gh release view --repo "$repo" --json tagName --jq '.tagName')
+  fi
+  [[ -n "$tag" ]] || { echo "fork-pull: could not determine release tag" >&2; exit 1; }
+
+  echo "Downloading $tag from $repo..."
+  gh release download "$tag" \
+    --repo "$repo" \
+    --dir "$work" \
+    --pattern 'herdr-fork-macos-aarch64.tar.gz' \
+    --pattern 'SHA256SUMS'
+  archive="$work/herdr-fork-macos-aarch64.tar.gz"
+fi
+
+if xattr -p com.apple.quarantine "$archive" >/dev/null 2>&1; then
+  echo "quarantine: com.apple.quarantine present on tarball; clearing before unpack"
+  xattr -d com.apple.quarantine "$archive"
+else
+  echo "quarantine: none on tarball"
+fi
+
+if [[ -f "$work/SHA256SUMS" ]]; then
+  echo "Verifying SHA256SUMS..."
+  (cd "$work" && shasum -a 256 -c SHA256SUMS)
+elif [[ -z "$from_archive" ]]; then
+  echo "fork-pull: SHA256SUMS missing" >&2
+  exit 1
+else
+  echo "Local --from mode: no sibling SHA256SUMS; skipping checksum file."
+fi
+
+tar -xzf "$archive" -C "$work"
+staged_app="$work/Herdr Fork.app"
+new_bin="$staged_app/Contents/MacOS/Herdr"
+[[ -x "$new_bin" ]] || { echo "fork-pull: binary missing in archive ($new_bin)" >&2; exit 1; }
+
+if xattr -p com.apple.quarantine "$staged_app" >/dev/null 2>&1; then
+  echo "quarantine: clearing com.apple.quarantine on extracted bundle"
+  xattr -dr com.apple.quarantine "$staged_app"
+fi
+
+echo "Verifying code signature..."
+codesign --verify --deep --strict "$staged_app"
+codesign -dvvv "$staged_app" 2>&1 | grep -E '^(Identifier|Authority|Signature|TeamIdentifier)=' || true
+
+echo "Checking binary version..."
+"$new_bin" --version
+
+mods_dir="$HOME/.config/herdr-app/mods"
+if [[ -d "$mods_dir" ]]; then
+  shopt -s nullglob
+  mods=("$mods_dir"/shadowfax*)
+  shopt -u nullglob
+  if (( ${#mods[@]} > 0 )); then
+    echo "Checking ${#mods[@]} shadowfax* mods..."
+    for mod in "${mods[@]}"; do
+      [[ -d "$mod" ]] || continue
+      "$new_bin" check "$mod"
+    done
+  fi
+fi
+
+if [[ -n "$dest_override" ]]; then
+  dest_dir="$dest_override"
+  backup_dir="$dest_dir/.herdr-fork-backup"
+else
+  dest_dir="$HOME/Applications"
+  backup_dir="$HOME/.local/share/herdr-fork-backup"
+fi
+
+mkdir -p "$dest_dir" "$backup_dir"
+dest_app="$dest_dir/Herdr Fork.app"
+backup_app="$backup_dir/Herdr Fork.app"
+prev_old="$backup_dir/Herdr Fork.app.prev"
+
+if [[ -d "$dest_app" ]]; then
+  rm -rf "$prev_old"
+  if [[ -d "$backup_app" ]]; then
+    mv "$backup_app" "$prev_old"
+  fi
+  mv "$dest_app" "$backup_app"
+  if ! mv "$staged_app" "$dest_app"; then
+    mv "$backup_app" "$dest_app"
+    [[ -d "$prev_old" ]] && mv "$prev_old" "$backup_app"
+    echo "fork-pull: swap failed; restored previous bundle." >&2
+    exit 1
+  fi
+  rm -rf "$prev_old"
+  printf 'replaced_by=%s\ndate=%s\n' "$tag" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$backup_dir/metadata.txt"
+else
+  mv "$staged_app" "$dest_app"
+fi
+
+if [[ -z "$dest_override" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  ln -sfn "$dest_app/Contents/MacOS/Herdr" "$HOME/.local/bin/herdr-app"
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$dest_app"
+else
+  echo "Test --dest mode: left ~/.local/bin/herdr-app and LaunchServices untouched."
+fi
+
+floor_file="$dest_app/Contents/Resources/core-version"
+[[ -f "$floor_file" ]] || floor_file="$repo_root/distribution/core-version"
+if [[ -f "$floor_file" ]] && command -v hc >/dev/null 2>&1; then
+  floor=$(tr -d '[:space:]' < "$floor_file")
+  have=$(hc --version | awk '{print $2}')
+  if [[ -n "$floor" && -n "$have" ]]; then
+    if version_lt "$have" "$floor"; then
+      if [[ -z "$dest_override" ]]; then
+        echo "Installed hc ($have) is below floor ($floor); running hc update..."
+        hc update --version "$floor"
+      else
+        echo "Test --dest mode: hc ($have) is below floor ($floor); skipping hc update."
+      fi
+    else
+      echo "hc $have meets core-version floor $floor (no hc update needed)."
+    fi
+  fi
+fi
+
+echo "Installed $tag to $dest_app — restart Herdr Fork to use it."

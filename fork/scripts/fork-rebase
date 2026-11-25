@@ -1,0 +1,107 @@
+#!/bin/bash
+# Local equivalent of fork-sync: create a backup ref, rebase `fork` onto the
+# target upstream tag or commit with rerere + --autosquash, show range-diff,
+# and run cargo test --locked.
+#
+# Usage:
+#   fork/scripts/fork-rebase [target]
+#
+# Defaults to the latest upstream v* tag.
+set -euo pipefail
+
+cd "$(dirname "$0")/../.."
+unset HERDR_APP_RELEASE
+
+target="${1:-}"
+branch=$(git symbolic-ref --short HEAD 2>/dev/null || true)
+[[ "$branch" == "fork" ]] || { echo "fork-rebase: expected branch 'fork' (got '${branch:-detached}')" >&2; exit 1; }
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "fork-rebase: working tree has uncommitted changes; commit or stash first." >&2
+  exit 1
+fi
+
+git config --local rerere.enabled true
+git config --local rerere.autoupdate true
+git config --local rebase.autoSquash true
+
+git fetch --tags upstream master
+
+old_head=$(git rev-parse HEAD)
+if [[ -n "$target" ]]; then
+  target_label="$target"
+  if ! git rev-parse --verify "${target}^{commit}" >/dev/null 2>&1; then
+    git fetch upstream "$target"
+  fi
+  target_sha=$(git rev-parse "${target}^{commit}" 2>/dev/null || git rev-parse FETCH_HEAD)
+else
+  target_label=$(git ls-remote --tags --refs upstream 'refs/tags/v*' \
+    | awk -F/ '{print $NF}' \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+    | sort -V \
+    | tail -1)
+  [[ -n "$target_label" ]] || { echo "fork-rebase: no upstream v* tags found" >&2; exit 1; }
+  target_sha=$(git rev-parse "refs/tags/${target_label}^{commit}")
+fi
+
+if git merge-base --is-ancestor "$target_sha" HEAD; then
+  echo "fork-rebase: $target_label ($target_sha) is already in fork ($old_head); nothing to do."
+  exit 0
+fi
+
+merge_base=$(git merge-base HEAD "$target_sha")
+tag_base=$(git tag --merged HEAD --sort=-v:refname 'v*' | head -1 || true)
+old_base="$merge_base"
+if [[ -n "$tag_base" ]]; then
+  tag_sha=$(git rev-parse "${tag_base}^{commit}")
+  if git merge-base --is-ancestor "$merge_base" "$tag_sha" && [[ "$tag_sha" != "$merge_base" ]]; then
+    old_base="$tag_sha"
+  fi
+fi
+
+safe_label=$(printf '%s' "$target_label" | tr -c 'A-Za-z0-9._-' '-')
+backup_branch="backup/pre-${safe_label}"
+if git show-ref --verify --quiet "refs/heads/$backup_branch"; then
+  backup_branch="${backup_branch}-$(date +%Y%m%d-%H%M%S)"
+fi
+git branch "$backup_branch" "$old_head"
+echo "Saved backup branch: $backup_branch ($old_head)"
+echo "Rebasing $old_base..$old_head onto $target_label ($target_sha)"
+
+if ! git rebase --autosquash --onto "$target_sha" "$old_base"; then
+  echo "" >&2
+  echo "Rebase stopped on conflict. Conflicting files:" >&2
+  git diff --name-only --diff-filter=U >&2 || true
+  echo "" >&2
+  echo "Resolve conflicts, then run:" >&2
+  echo "  git add <files> && git rebase --continue" >&2
+  echo "Or abort and restore:" >&2
+  echo "  git rebase --abort   # backup is at $backup_branch" >&2
+  exit 1
+fi
+
+git submodule sync --recursive
+git submodule update --init --recursive
+
+echo ""
+echo "=== git range-diff ==="
+git range-diff "$old_base..$old_head" "$target_sha..HEAD"
+
+echo ""
+echo "=== cargo test --locked ==="
+ZIG="${ZIG:-$HOME/.local/share/herdr-build/zig-aarch64-macos-0.16.0/zig}"
+[[ -x "$ZIG" ]] || { echo "fork-rebase: Zig 0.16.0 not found at $ZIG" >&2; exit 1; }
+ZIG="$ZIG" cargo test --locked
+
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+last_n=$(git tag -l "fork-v${version}-*" \
+  | sed -n "s/^fork-v${version}-\([0-9][0-9]*\)$/\1/p" \
+  | sort -n \
+  | tail -1)
+next_tag="fork-v${version}-$(( ${last_n:-0} + 1 ))"
+
+echo ""
+echo "Rebase and tests passed. To publish:"
+echo "  git push origin $backup_branch"
+echo "  git push --force-with-lease origin fork"
+echo "  git tag -a $next_tag -m \"Fork release $next_tag\" && git push origin refs/tags/$next_tag"

@@ -1,0 +1,181 @@
+# Build, self-sign, and publish a macOS fork release on fork-v* tags.
+# Also runnable via workflow_dispatch (with --ref fork-v...) from fork-sync.yml
+# because a tag pushed with GITHUB_TOKEN does not trigger on: push workflows.
+name: fork-release
+run-name: fork release ${{ github.ref_name }}
+
+on:
+  push:
+    tags: ["fork-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+  ZIG_VERSION: 0.16.0
+  CARGO_INCREMENTAL: "0"
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  release:
+    if: >-
+      startsWith(github.ref, 'refs/tags/fork-v')
+      && (github.actor == 'shadowfax92' || github.actor == 'github-actions[bot]')
+    runs-on: macos-15
+    environment: release
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag
+        id: tag
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if [[ ! "$tag" =~ ^fork-v([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)$ ]]; then
+            echo "Invalid fork tag: $tag (expected fork-v<upstream>-<n>)" >&2
+            exit 1
+          fi
+          tag_ver="${BASH_REMATCH[1]}"
+          build_num="${BASH_REMATCH[2]}"
+          cargo_ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ "$tag_ver" != "$cargo_ver" ]]; then
+            echo "Tag says $tag_ver but Cargo.toml says $cargo_ver" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$cargo_ver" >> "$GITHUB_OUTPUT"
+          echo "build_num=$build_num" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Restore build cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: &cache-paths |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: fork-release-macos-aarch64-${{ env.RUST_TOOLCHAIN }}-zig${{ env.ZIG_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**', 'crates/**') }}-${{ github.sha }}
+          restore-keys: |
+            fork-release-macos-aarch64-${{ env.RUST_TOOLCHAIN }}-zig${{ env.ZIG_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**', 'crates/**') }}-
+            fork-release-macos-aarch64-${{ env.RUST_TOOLCHAIN }}-zig${{ env.ZIG_VERSION }}-
+
+      - name: Keep unchanged sources fresh
+        run: scripts/ci-sources restore
+
+      - name: Build release binary (without HERDR_APP_RELEASE)
+        run: |
+          unset HERDR_APP_RELEASE
+          cargo build --release --locked
+
+      - name: Note the sources the cache was built from
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: scripts/ci-sources record
+
+      - name: Save build cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *cache-paths
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Assemble, sign, and pack
+        env:
+          FORK_CERTIFICATE_P12: ${{ secrets.FORK_CERTIFICATE_P12 }}
+          FORK_CERTIFICATE_PASSWORD: ${{ secrets.FORK_CERTIFICATE_PASSWORD }}
+        run: |
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          app="$work/Herdr Fork.app"
+          scripts/build-fork-macos \
+            --assemble-only \
+            --binary target/release/herdr-app \
+            --out "$app" \
+            --version "${{ steps.tag.outputs.version }}" \
+            --bundle-version "${{ steps.tag.outputs.build_num }}"
+
+          codesign --verify --deep --strict "$app"
+          sig_info=$(codesign -dvvv "$app" 2>&1)
+          printf '%s\n' "$sig_info" | grep -E '^(Identifier|Authority|Signature|TeamIdentifier)=' || true
+          if [[ -n "${FORK_CERTIFICATE_P12:-}" ]]; then
+            printf '%s\n' "$sig_info" | grep -q '^Authority=Herdr Fork Self-Signed$' || {
+              echo "Expected self-signed authority 'Herdr Fork Self-Signed'" >&2
+              exit 1
+            }
+          fi
+
+          "$app/Contents/MacOS/Herdr" --version
+
+          mkdir -p dist
+          archive="dist/herdr-fork-macos-aarch64.tar.gz"
+          COPYFILE_DISABLE=1 tar -czf "$archive" -C "$work" "Herdr Fork.app"
+          tar -xOf "$archive" "Herdr Fork.app/Contents/Resources/THIRD-PARTY-NOTICES" | cmp - THIRD-PARTY-NOTICES
+          tar -xOf "$archive" "Herdr Fork.app/Contents/Resources/LICENSE" | cmp - LICENSE
+          tar -xOf "$archive" "Herdr Fork.app/Contents/Resources/core-version" | cmp - distribution/core-version
+
+          (cd dist && shasum -a 256 herdr-fork-macos-aarch64.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          ver="${{ steps.tag.outputs.version }}"
+          core_floor=$(tr -d '[:space:]' < distribution/core-version)
+          base_tag=$(git tag --merged HEAD --sort=-v:refname 'v*' | head -1 || true)
+          if [[ -n "$base_tag" ]]; then
+            commits=$(git log --oneline "${base_tag}..HEAD")
+          else
+            commits=$(git log --oneline -n 10 HEAD)
+          fi
+
+          notes_file=$(mktemp)
+          trap 'rm -f "$notes_file"' EXIT
+          {
+            echo "## Herdr Fork \`$tag\`"
+            echo ""
+            echo "- Upstream base: \`${base_tag:-v$ver}\` (\`$(git rev-parse --short HEAD)\`)"
+            echo "- Signing: self-signed (\`Herdr Fork Self-Signed\`, \`dev.herdr.app.fork\`)"
+            echo "- Core floor (\`distribution/core-version\`): \`$core_floor\`"
+            echo ""
+            echo "### Fork commits"
+            echo '```text'
+            echo "$commits"
+            echo '```'
+            echo ""
+            echo "### SHA256SUMS"
+            echo '```text'
+            cat dist/SHA256SUMS
+            echo '```'
+          } > "$notes_file"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" dist/herdr-fork-macos-aarch64.tar.gz dist/SHA256SUMS --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --notes-file "$notes_file" --draft=false --latest
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" dist/herdr-fork-macos-aarch64.tar.gz dist/SHA256SUMS \
+              --draft --title "$tag" --notes-file "$notes_file"
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi

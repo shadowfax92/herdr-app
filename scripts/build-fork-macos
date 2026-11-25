@@ -1,6 +1,19 @@
 #!/bin/bash
-# Build and ad-hoc sign ~/Applications/Herdr Fork.app for local testing without
-# touching /Applications/Herdr.app or ~/.local/bin/herdr-app.
+# Build and/or assemble and sign Herdr Fork.app without touching
+# /Applications/Herdr.app.
+#
+# Usage:
+#   scripts/build-fork-macos                         # build & install to ~/Applications/Herdr Fork.app
+#   scripts/build-fork-macos --assemble-only \
+#     --binary target/release/herdr-app \
+#     --out dist/Herdr\ Fork.app \
+#     --version 0.1.18 --bundle-version 1
+#
+# Signing order:
+#   1. FORK_CERTIFICATE_P12 + FORK_CERTIFICATE_PASSWORD env vars (ephemeral keychain, CI)
+#   2. Self-signed identity in the login keychain
+#   3. ~/.local/share/herdr-fork-signing/{cert.p12,password} (ephemeral keychain, local)
+#   4. Ad-hoc signature (-) fallback
 set -euo pipefail
 
 [[ $(uname -s) == Darwin ]] || { echo 'This script requires macOS.' >&2; exit 1; }
@@ -9,21 +22,51 @@ cd "$(dirname "$0")/.."
 # Never enable upstream release self-updates or telemetry on the fork.
 unset HERDR_APP_RELEASE
 
-ZIG="${ZIG:-/Users/shadowfax/.local/share/herdr-build/zig-aarch64-macos-0.16.0/zig}"
-[[ -x "$ZIG" ]] || { echo "Zig 0.16.0 not found at $ZIG" >&2; exit 1; }
-
-ZIG="$ZIG" cargo build --release --locked
-
+assemble_only=false
+binary="target/release/herdr-app"
 app="$HOME/Applications/Herdr Fork.app"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$HOME/.local/bin"
+version=""
+bundle_version="${FORK_BUNDLE_VERSION:-1}"
+identity_name="${FORK_SIGNING_IDENTITY:-Herdr Fork Self-Signed}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --assemble-only) assemble_only=true; shift ;;
+    --binary) binary="${2:?missing --binary value}"; shift 2 ;;
+    --out) app="${2:?missing --out value}"; shift 2 ;;
+    --version) version="${2:?missing --version value}"; shift 2 ;;
+    --bundle-version) bundle_version="${2:?missing --bundle-version value}"; shift 2 ;;
+    -h|--help)
+      sed -n '2,17p' "$0"
+      exit 0
+      ;;
+    *) echo "build-fork-macos: unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z $version ]]; then
+  version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+fi
+
+if [[ $assemble_only == false ]]; then
+  ZIG="${ZIG:-$HOME/.local/share/herdr-build/zig-aarch64-macos-0.16.0/zig}"
+  [[ -x "$ZIG" ]] || { echo "Zig 0.16.0 not found at $ZIG" >&2; exit 1; }
+  ZIG="$ZIG" cargo build --release --locked
+fi
+
+[[ -f "$binary" ]] || { echo "build-fork-macos: binary not found at $binary" >&2; exit 1; }
+
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
 # Replace atomically so rebuilding does not corrupt an existing binary.
-cp target/release/herdr-app "$app/Contents/MacOS/Herdr.new"
+cp "$binary" "$app/Contents/MacOS/Herdr.new"
 mv -f "$app/Contents/MacOS/Herdr.new" "$app/Contents/MacOS/Herdr"
 chmod +x "$app/Contents/MacOS/Herdr"
 cp assets/icons/Herdr.icns "$app/Contents/Resources/Herdr.icns"
+cp LICENSE THIRD-PARTY-NOTICES "$app/Contents/Resources/"
+cp distribution/core-version "$app/Contents/Resources/core-version"
 
-cat > "$app/Contents/Info.plist" <<'PLIST'
+cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -33,8 +76,8 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
     <key>CFBundleDisplayName</key><string>Herdr Fork</string>
     <key>CFBundleIconFile</key><string>Herdr</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1.18-fork</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>${version}-fork</string>
+    <key>CFBundleVersion</key><string>${bundle_version}</string>
     <key>NSMicrophoneUsageDescription</key><string>Terminal programs running in Herdr can use the microphone, for example for voice input.</string>
     <key>NSCameraUsageDescription</key><string>Terminal programs running in Herdr can use the camera.</string>
     <key>NSAppleEventsUsageDescription</key><string>Terminal programs running in Herdr can use AppleScript to control other apps.</string>
@@ -43,12 +86,89 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
     <key>LSEnvironment</key><dict/></dict></plist>
 PLIST
 
-# Finder does not inherit a login shell's PATH; hc and nvim must stay discoverable.
-/usr/libexec/PlistBuddy -c "Add :LSEnvironment:PATH string $HOME/.local/bin:/opt/homebrew/bin:$PATH" "$app/Contents/Info.plist"
-codesign --force --sign - --entitlements scripts/macos-entitlements.plist "$app"
+if [[ $assemble_only == false ]]; then
+  # Finder does not inherit a login shell's PATH; hc and nvim stay discoverable.
+  /usr/libexec/PlistBuddy -c "Add :LSEnvironment:PATH string $HOME/.local/bin:/opt/homebrew/bin:$PATH" "$app/Contents/Info.plist"
+fi
+
+cleanup_paths=()
+restore_keychains=()
+cleanup_keychain=""
+cleanup_all() {
+  if (( ${#restore_keychains[@]} > 0 )); then
+    security list-keychains -d user -s "${restore_keychains[@]}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$cleanup_keychain" ]]; then
+    security delete-keychain "$cleanup_keychain" >/dev/null 2>&1 || true
+  fi
+  if (( ${#cleanup_paths[@]} > 0 )); then
+    rm -rf "${cleanup_paths[@]}"
+  fi
+}
+trap cleanup_all EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+sign_with_ephemeral_p12() {
+  local p12_path="$1"
+  local p12_pass="$2"
+  local work keychain kcpw sha1 entry
+
+  umask 077
+  work=$(mktemp -d)
+  cleanup_paths+=("$work")
+  keychain="$work/fork-signing.keychain-db"
+  cleanup_keychain="$keychain"
+  restore_keychains=()
+  while IFS= read -r entry; do
+    [[ -n $entry ]] && restore_keychains+=("$entry")
+  done < <(security list-keychains -d user | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
+
+  kcpw=$(openssl rand -hex 32)
+  security create-keychain -p "$kcpw" "$keychain"
+  security set-keychain-settings -lut 21600 "$keychain"
+  security unlock-keychain -p "$kcpw" "$keychain"
+  security import "$p12_path" -k "$keychain" -f pkcs12 -P "$p12_pass" -T /usr/bin/codesign >/dev/null
+  security set-key-partition-list -S apple-tool:,apple: -s -k "$kcpw" "$keychain" >/dev/null
+  security list-keychains -d user -s "$keychain" ${restore_keychains[@]+"${restore_keychains[@]}"}
+
+  # Omit -v because self-signed certificates carry CSSMERR_TP_NOT_TRUSTED yet sign cleanly.
+  sha1=$(security find-identity -p codesigning "$keychain" | awk -v id="\"$identity_name\"" 'index($0, id) { print $2; exit }')
+  [[ -n $sha1 ]] || { echo "build-fork-macos: identity \"$identity_name\" not found in .p12" >&2; return 1; }
+
+  codesign --force --keychain "$keychain" --entitlements scripts/macos-entitlements.plist --sign "$sha1" "$app"
+}
+
+login_kc="$HOME/Library/Keychains/login.keychain-db"
+local_signing_dir="${FORK_SIGNING_DIR:-$HOME/.local/share/herdr-fork-signing}"
+
+if [[ -n ${FORK_CERTIFICATE_P12:-} && -n ${FORK_CERTIFICATE_PASSWORD:-} ]]; then
+  echo "build-fork-macos: signing with FORK_CERTIFICATE_P12 (ephemeral keychain)"
+  umask 077
+  p12_dir=$(mktemp -d)
+  cleanup_paths+=("$p12_dir")
+  p12_tmp="$p12_dir/certificate.p12"
+  printf '%s' "$FORK_CERTIFICATE_P12" | base64 --decode > "$p12_tmp"
+  chmod 600 "$p12_tmp"
+  sign_with_ephemeral_p12 "$p12_tmp" "$FORK_CERTIFICATE_PASSWORD"
+elif login_sha1=$(security find-identity -p codesigning "$login_kc" 2>/dev/null | awk -v id="\"$identity_name\"" 'index($0, id) { print $2; exit }') && [[ -n $login_sha1 ]]; then
+  echo "build-fork-macos: signing with login keychain identity \"$identity_name\""
+  codesign --force --keychain "$login_kc" --entitlements scripts/macos-entitlements.plist --sign "$login_sha1" "$app"
+elif [[ -f "$local_signing_dir/cert.p12" && -f "$local_signing_dir/password" ]]; then
+  echo "build-fork-macos: signing with $local_signing_dir/cert.p12 (ephemeral keychain)"
+  sign_with_ephemeral_p12 "$local_signing_dir/cert.p12" "$(<"$local_signing_dir/password")"
+else
+  echo "build-fork-macos: signing identity not found; falling back to ad-hoc"
+  codesign --force --sign - --entitlements scripts/macos-entitlements.plist "$app"
+fi
+
 codesign --verify --deep --strict "$app"
 
-# Keep ~/.local/bin/herdr-app pointing at the official app.
-ln -sfn "$app/Contents/MacOS/Herdr" "$HOME/.local/bin/herdr-app-fork"
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app"
-echo "Installed $app and linked $HOME/.local/bin/herdr-app-fork."
+if [[ $assemble_only == false ]]; then
+  mkdir -p "$HOME/.local/bin"
+  ln -sfn "$app/Contents/MacOS/Herdr" "$HOME/.local/bin/herdr-app"
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app"
+  echo "Installed $app and linked $HOME/.local/bin/herdr-app."
+else
+  echo "Assembled and signed $app."
+fi

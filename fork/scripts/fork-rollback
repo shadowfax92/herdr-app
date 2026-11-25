@@ -1,0 +1,59 @@
+#!/bin/bash
+# Put the previous Herdr Fork.app bundle back from ~/.local/share/herdr-fork-backup/.
+#
+# Usage:
+#   fork/scripts/fork-rollback [--dest <dir>]
+#
+# Never quits a running Herdr Fork.app.
+set -euo pipefail
+
+[[ $(uname -s) == Darwin ]] || { echo 'fork-rollback: macOS only.' >&2; exit 1; }
+
+dest_override=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dest) dest_override="${2:?missing --dest value}"; shift 2 ;;
+    -h|--help)
+      sed -n '2,7p' "$0"
+      exit 0
+      ;;
+    *) echo "fork-rollback: unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -n "$dest_override" ]]; then
+  dest_dir="$dest_override"
+  backup_dir="$dest_dir/.herdr-fork-backup"
+else
+  dest_dir="$HOME/Applications"
+  backup_dir="$HOME/.local/share/herdr-fork-backup"
+fi
+
+dest_app="$dest_dir/Herdr Fork.app"
+backup_app="$backup_dir/Herdr Fork.app"
+tmp_app="$backup_dir/Herdr Fork.app.swap"
+
+[[ -d "$backup_app" ]] || { echo "fork-rollback: no backup bundle found at $backup_app" >&2; exit 1; }
+
+rm -rf "$tmp_app"
+if [[ -d "$dest_app" ]]; then
+  mv "$dest_app" "$tmp_app"
+fi
+
+if ! mv "$backup_app" "$dest_app"; then
+  [[ -d "$tmp_app" ]] && mv "$tmp_app" "$dest_app"
+  echo "fork-rollback: restore failed; original bundle kept." >&2
+  exit 1
+fi
+
+if [[ -d "$tmp_app" ]]; then
+  mv "$tmp_app" "$backup_app"
+fi
+
+if [[ -z "$dest_override" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  ln -sfn "$dest_app/Contents/MacOS/Herdr" "$HOME/.local/bin/herdr-app"
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$dest_app"
+fi
+
+echo "Restored previous bundle to $dest_app — restart Herdr Fork to use it."
